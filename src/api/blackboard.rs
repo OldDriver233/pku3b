@@ -1,6 +1,11 @@
 use crate::api::low_level::blackboard::BlackboardUnautherizedError;
+use crate::api::low_level::blackboard::LIST_CONTENT;
 
 use super::*;
+use std::collections::VecDeque;
+use url::Url;
+
+const MAX_DEPTH: usize = 20; // 最大深度限制
 
 impl Client {
     pub async fn blackboard(
@@ -218,23 +223,31 @@ impl Course {
     }
 
     pub fn content_stream(&self) -> CourseContentStream {
-        CourseContentStream::new(
-            self.client.clone(),
-            self.meta.clone(),
-            self.entries()
-                .iter()
-                .filter_map(|(_, uri)| {
-                    let url = low_level::convert_uri(uri).ok()?.into_url().ok()?;
-                    if !low_level::blackboard::LIST_CONTENT.ends_with(url.path()) {
-                        return None;
+        let mut initial_probes = Vec::new();
+
+        for (section_name, uri) in &self.entries {
+            // 修正：使用 Url::parse 代替 into_url
+            if let Ok(uri_str) = low_level::convert_uri(uri) {
+                if let Ok(url) = Url::parse(&uri_str) {
+                    if LIST_CONTENT.ends_with(url.path()) {
+                        for (key, value) in url.query_pairs() {
+                            if key == "content_id" {
+                                let probe = ContentProbe {
+                                    parent_id: None,
+                                    parent_title: None,
+                                    depth: 0,
+                                    id: value.to_string(),
+                                    section_name: Some(section_name.clone()),
+                                };
+                                initial_probes.push(probe);
+                            }
+                        }
                     }
+                }
+            }
+        }
 
-                    let (_, content_id) = url.query_pairs().find(|(k, _)| k == "content_id")?;
-
-                    Some(content_id.to_string())
-                })
-                .collect(),
-        )
+        CourseContentStream::new(self.client.clone(), self.meta.clone(), initial_probes)
     }
 
     pub fn build_content(&self, data: CourseContentData) -> CourseContent {
@@ -470,6 +483,11 @@ impl Course {
                 } else {
                     None
                 },
+                parent_id: None,
+                parent_title: None,
+                depth: 0,
+                section_name: None,
+                is_folder: false,
             };
 
             announcements.push(CourseAnnouncementHandle {
@@ -486,79 +504,223 @@ impl Course {
 
         Ok(announcements)
     }
+
+    pub async fn list_documents(&self) -> anyhow::Result<Vec<CourseDocumentHandle>> {
+        let mut stream = self.content_stream();
+        let mut docs = Vec::new();
+
+        while let Some(batch) = stream.next_batch().await {
+            docs.extend(
+                batch
+                    .into_iter()
+                    .filter(|d| matches!(d.kind, CourseContentKind::Document))
+                    .map(|data| CourseDocumentHandle {
+                        client: self.client.clone(),
+                        course: self.meta.clone(),
+                        content: data.into(), // Arc<CourseContentData>
+                    }),
+            );
+        }
+        Ok(docs)
+    }
+
+    pub async fn list_assignments_with_hierarchy(
+        &self,
+    ) -> anyhow::Result<Vec<CourseAssignmentHandle>> {
+        let mut stream = self.content_stream();
+        let mut results = Vec::new();
+
+        while let Some(batch) = stream.next_batch().await {
+            for content in batch {
+                if let CourseContentKind::Assignment = content.kind {
+                    results.push(CourseAssignmentHandle {
+                        client: self.client.clone(),
+                        course: self.meta.clone(),
+                        content: Arc::new(content),
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// 列出本课程所有 Document（包含层级信息）
+    pub async fn list_documents_with_hierarchy(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<CourseDocumentHandle>,
+        Vec<usize>,          // depths
+        Vec<Option<String>>, // parent_ids
+    )> {
+        let mut stream = self.content_stream();
+        let mut handles = Vec::new();
+        let mut depths = Vec::new();
+        let mut parent_ids = Vec::new();
+
+        while let Some(batch) = stream.next_batch().await {
+            for data in batch {
+                if matches!(data.kind, CourseContentKind::Document) {
+                    handles.push(CourseDocumentHandle {
+                        client: self.client.clone(),
+                        course: self.meta.clone(),
+                        content: Arc::new(data.clone()),
+                    });
+                    depths.push(data.depth);
+                    parent_ids.push(data.parent_id);
+                }
+            }
+        }
+
+        Ok((handles, depths, parent_ids))
+    }
 }
 
+#[derive(Debug)]
+struct ContentProbe {
+    parent_id: Option<String>,
+    parent_title: Option<String>,
+    depth: usize,
+    id: String,
+    section_name: Option<String>,
+}
 pub struct CourseContentStream {
     /// 一次性发射的请求数量
     batch_size: usize,
     client: Client,
     course: Arc<CourseMeta>,
     visited_ids: HashSet<String>,
-    probe_ids: Vec<String>,
+    probe_queue: VecDeque<ContentProbe>,
+    parent_map: HashMap<String, Option<String>>,
+    depth_map: HashMap<String, usize>,
 }
 
 impl CourseContentStream {
-    fn new(client: Client, course: Arc<CourseMeta>, probe_ids: Vec<String>) -> Self {
+    fn new(client: Client, course: Arc<CourseMeta>, initial_probes: Vec<ContentProbe>) -> Self {
         // implicitly deduplicate probe_ids
-        let visited_ids = HashSet::from_iter(probe_ids);
-        let probe_ids = visited_ids.iter().cloned().collect();
+        let visited_ids = initial_probes
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<HashSet<_>>();
+        let probe_queue = VecDeque::from(initial_probes);
+        let mut parent_map = HashMap::new();
+        let mut depth_map = HashMap::new();
+        for probe in &probe_queue {
+            parent_map.insert(probe.id.clone(), probe.parent_id.clone());
+            depth_map.insert(probe.id.clone(), probe.depth);
+        }
+
         Self {
             batch_size: 8,
             client,
             course,
             visited_ids,
-            probe_ids,
+            probe_queue,
+            parent_map,
+            depth_map,
         }
     }
-    async fn try_next_batch(&mut self, ids: &[String]) -> anyhow::Result<Vec<CourseContentData>> {
-        let futs = ids
+    
+    async fn try_next_batch(&mut self) -> anyhow::Result<Vec<CourseContentData>> {
+        if self.probe_queue.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut batch = Vec::with_capacity(self.batch_size);
+        let mut to_process = Vec::with_capacity(self.batch_size);
+
+        // 准备要处理的探测点
+        for _ in 0..self.batch_size {
+            if let Some(probe) = self.probe_queue.pop_front() {
+                if probe.depth >= MAX_DEPTH {
+                    log::warn!("达到最大深度限制: {} (当前深度 {})", probe.id, probe.depth);
+                    continue;
+                }
+                to_process.push(probe);
+            } else {
+                break;
+            }
+        }
+
+        let futs = to_process
             .iter()
-            .map(|id| self.client.bb_course_content_page(&self.course.id, id));
+            .map(|p| self.client.bb_course_content_page(&self.course.id, &p.id));
 
         let doms = futures_util::future::join_all(futs).await;
 
-        let mut all_contents = Vec::new();
-        for dom in doms {
-            let dom = dom?;
-            let selector = Selector::parse("#content_listContainer > li").unwrap();
-            let contents = dom
-                .select(&selector)
-                .filter_map(|li| {
-                    CourseContentData::from_element(li)
-                        .inspect_err(|e| log::warn!("CourseContentData::from_element error: {e}"))
-                        .ok()
-                })
-                // filter out visited ids
-                .filter(|data| self.visited_ids.insert(data.id.to_owned()))
-                // add the rest new ids to probe_ids
-                .inspect(|data| {
-                    if data.has_link {
-                        self.probe_ids.push(data.id.to_owned())
+        for (probe, dom_result) in to_process.into_iter().zip(doms.into_iter()) {
+            match dom_result {
+                Ok(dom) => {
+                    let selector = Selector::parse("#content_listContainer > li").unwrap();
+                    for li in dom.select(&selector) {
+                        match CourseContentData::from_element(
+                            li,
+                            probe.parent_id.as_deref(),
+                            probe.parent_title.as_deref(),
+                            probe.depth,
+                            probe.section_name.as_deref(),
+                        ) {
+                            Ok(data) => {
+                                // 更新层级映射
+                                self.parent_map
+                                    .insert(data.id.clone(), Some(probe.id.clone()));
+                                self.depth_map.insert(data.id.clone(), data.depth);
+
+                                // 添加到批次
+                                batch.push(data.clone());
+
+                                // 如果是文件夹且有链接，添加到探测队列
+                                if data.is_folder && data.has_link {
+                                    let child_probe = ContentProbe {
+                                        parent_id: Some(data.id.clone()),
+                                        parent_title: Some(data.title.clone()), // 使用文件夹标题作为子节点的父标题
+                                        depth: data.depth,
+                                        id: data.id.clone(),
+                                        section_name: probe.section_name.clone(), // 保持同一栏目
+                                    };
+
+                                    self.probe_queue.push_back(child_probe);
+                                }
+                            }
+                            Err(e) => log::warn!("解析元素错误: {}", e),
+                        }
                     }
-                });
-
-            all_contents.extend(contents);
+                }
+                Err(e) => {
+                    log::warn!("内容页面获取失败 {}: {}", probe.id, e);
+                    // 重新加入队列重试
+                    self.probe_queue.push_back(probe);
+                }
+            }
         }
 
-        Ok(all_contents)
+        Ok(batch)
     }
+
     pub async fn next_batch(&mut self) -> Option<Vec<CourseContentData>> {
-        let ids = self
-            .probe_ids
-            .split_off(self.probe_ids.len().saturating_sub(self.batch_size));
-        if ids.is_empty() {
-            return None;
-        }
-        match self.try_next_batch(&ids).await {
-            Ok(r) => Some(r),
+        match self.try_next_batch().await {
+            Ok(batch) if !batch.is_empty() => Some(batch),
+            Ok(_) => None,
             Err(e) => {
-                log::warn!("try_next_batch error {ids:?}: {e}");
-                return Box::pin(self.next_batch()).await;
+                log::warn!("try_next_batch 错误: {}", e);
+                None
             }
         }
     }
+    pub fn get_parent(&self, id: &str) -> Option<&str> {
+        self.parent_map
+            .get(id)
+            .and_then(|opt| opt.as_ref().map(|s| s.as_str()))
+    }
+    pub fn get_children(&self, id: &str) -> Vec<&str> {
+        self.parent_map
+            .iter()
+            .filter(|(_, parent)| parent.as_ref().is_some_and(|p| p == id))
+            .map(|(child, _)| child.as_str())
+            .collect()
+    }
     pub fn num_finished(&self) -> usize {
-        self.visited_ids.len() - self.probe_ids.len()
+        self.visited_ids.len() - self.probe_queue.len()
     }
     pub fn len(&self) -> usize {
         self.visited_ids.len()
@@ -586,15 +748,17 @@ impl CourseContent {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Copy, Clone, serde::Deserialize, serde::Serialize)]
 enum CourseContentKind {
     Document,
     Assignment,
     Announcement,
+    Folder,
+    Video,
     Unknown,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct CourseContentData {
     id: String,
     title: String,
@@ -604,6 +768,12 @@ pub struct CourseContentData {
     attachments: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     time: Option<String>,
+    // 新增字段：父节点ID和层级深度
+    parent_id: Option<String>,
+    pub parent_title: Option<String>, // 新增：父节点标题
+    depth: usize,
+    pub section_name: Option<String>, // 新增：所属栏目名称（如"课程课件"）
+    pub is_folder: bool,              // 是否是文件夹
 }
 
 fn collect_text(element: scraper::ElementRef) -> String {
@@ -645,7 +815,13 @@ fn announcement_dedup_key(title: &str, content: &str, time: &str) -> String {
 }
 
 impl CourseContentData {
-    fn from_element(el: scraper::ElementRef<'_>) -> anyhow::Result<Self> {
+    fn from_element(
+        el: scraper::ElementRef<'_>,
+        parent_id: Option<&str>,
+        parent_title: Option<&str>,
+        depth: usize,
+        section_name: Option<&str>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(el.value().name() == "li", "not a li element");
         let (img, title_div, detail_div) = el
             .child_elements()
@@ -653,20 +829,24 @@ impl CourseContentData {
             .collect_tuple()
             .context("failed to collect 3 child elements")?;
 
-        let kind = match img.attr("alt") {
-            Some("作业") => CourseContentKind::Assignment,
-            Some("项目") | Some("文件") => CourseContentKind::Document,
-            alt => {
+        let alt = img.attr("alt");
+        let (kind, is_folder) = match alt {
+            Some("作业") => (CourseContentKind::Assignment, false),
+            Some("内容文件夹") | Some("文件夹") | Some("目录") => {
+                (CourseContentKind::Folder, true)
+            } // 使用 Folder 变体
+            Some("项目") | Some("文件") => (CourseContentKind::Document, false),
+            Some(alt) => {
                 log::warn!("unknown content kind: {alt:?}");
-                CourseContentKind::Unknown
+                (CourseContentKind::Unknown, false)
             }
+            None => (CourseContentKind::Unknown, false),
         };
 
         let id = title_div
             .attr("id")
             .context("content_id not found")?
             .to_owned();
-
         let title = title_div.text().collect::<String>().trim().to_owned();
         let has_link = title_div
             .select(&Selector::parse("a").unwrap())
@@ -700,6 +880,11 @@ impl CourseContentData {
             descriptions,
             attachments,
             time: None,
+            parent_id: parent_id.map(ToOwned::to_owned),
+            parent_title: parent_title.map(ToOwned::to_owned),
+            depth,
+            section_name: section_name.map(ToOwned::to_owned),
+            is_folder,
         })
     }
 }
@@ -1429,6 +1614,113 @@ pub fn get_mime_type(extension: &str) -> &str {
         .get(extension)
         .copied()
         .unwrap_or("application/octet-stream")
+}
+
+#[derive(Debug, Clone)]
+pub struct CourseDocumentHandle {
+    pub client: Client,
+    pub course: Arc<CourseMeta>,
+    pub content: Arc<CourseContentData>,
+}
+
+impl CourseDocumentHandle {
+    /// 获取深度（在内容树中的层级）
+    pub fn depth(&self) -> usize {
+        self.content.depth
+    }
+
+    /// 获取父节点ID
+    pub fn parent_id(&self) -> Option<String> {
+        self.content.parent_id.clone()
+    }
+    /// 与 Assignment 相同的稳定 id
+    pub fn id(&self) -> String {
+        let mut h = std::hash::DefaultHasher::new();
+        self.course.id.hash(&mut h);
+        self.content.id.hash(&mut h);
+        format!("{:x}", h.finish())
+    }
+    /// 课程内容标题（与 Assignment/Video 的实现保持一致）
+    pub fn title(&self) -> &str {
+        &self.content.title
+    }
+
+    pub async fn get(&self) -> anyhow::Result<CourseDocument> {
+        Ok(CourseDocument {
+            client: self.client.clone(),
+            course: self.course.clone(),
+            content: self.content.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CourseDocument {
+    pub client: Client,
+    pub course: Arc<CourseMeta>,
+    pub content: Arc<CourseContentData>,
+}
+
+impl CourseDocument {
+    /* —— 基本信息 —— */
+    pub fn id(&self) -> String {
+        self.course.id().to_owned()
+    }
+    pub fn title(&self) -> &str {
+        &self.content.title
+    }
+    pub fn descriptions(&self) -> &[String] {
+        &self.content.descriptions
+    }
+    pub fn attachments(&self) -> &[(String, String)] {
+        &self.content.attachments
+    }
+    pub async fn download_attachment(
+        &self,
+        uri: &str,
+        dest: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        log::debug!(
+            "downloading attachment from https://course.pku.edu.cn{}",
+            uri
+        );
+
+        // 第 1 次请求：有时直接 200，有时先 302
+        let res = self.client.get_by_uri(uri).await?;
+        match res.status().as_u16() {
+            /* ---------- ① 302 跳转 ---------- */
+            302 => {
+                let loc = res
+                    .headers()
+                    .get("location")
+                    .context("location header not found")?
+                    .to_str()
+                    .context("location header not str")?
+                    .to_owned();
+
+                log::debug!("redirected to https://course.pku.edu.cn{}", loc);
+
+                let res2 = self.client.get_by_uri(&loc).await?;
+                anyhow::ensure!(res2.status().is_success(), "status not success");
+
+                let body = res2.bytes().await?;
+                let r = compio::fs::write(dest, body).await;
+                compio::buf::buf_try!(@try r);
+            }
+
+            /* ---------- ② 直接 200 OK ---------- */
+            200 => {
+                let body = res.bytes().await?;
+                let r = compio::fs::write(dest, body).await;
+                compio::buf::buf_try!(@try r);
+            }
+
+            other => anyhow::bail!("unexpected status {}", other),
+        }
+
+        log::debug!("attachment saved -> {}", dest.display());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
