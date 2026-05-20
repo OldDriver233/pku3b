@@ -746,6 +746,18 @@ impl CourseContent {
             None
         }
     }
+
+    pub fn into_document_opt(self) -> Option<CourseDocumentHandle> {
+        if let CourseContentKind::Document = self.data.kind {
+            Some(CourseDocumentHandle {
+                client: self.client,
+                course: self.course,
+                content: self.data,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, serde::Deserialize, serde::Serialize)]

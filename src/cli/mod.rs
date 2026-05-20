@@ -10,6 +10,7 @@ mod cmd_thesis_lib;
 #[cfg(feature = "ttshitu")]
 mod cmd_ttshitu;
 mod cmd_video;
+mod cmd_document;
 mod pbar;
 
 use crate::api::{blackboard::*, syllabus::*};
@@ -50,6 +51,10 @@ enum Commands {
     /// 获取课程作业信息/下载附件/提交作业
     #[command(visible_alias("a"), arg_required_else_help(true))]
     Assignment(cmd_assignment::CommandAssignment),
+
+    /// 获取课程文档
+    #[command(visible_alias("d"), arg_required_else_help(true))]
+    Document(cmd_document::CommandDocument),
 
     /// 获取个人课表
     #[command(name = "coursetable", visible_alias("ct"))]
@@ -301,6 +306,7 @@ pub async fn start(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             Commands::Assignment(cmd) => cmd_assignment::run(cmd).await?,
+            Commands::Document(cmd) => cmd_document::run(cmd).await?,
             Commands::CourseTable(cmd) => cmd_course_table::run(cmd).await?,
             Commands::Announcement(cmd) => cmd_announcement::run(cmd).await?,
             Commands::Video(cmd) => cmd_video::run(cmd).await?,
