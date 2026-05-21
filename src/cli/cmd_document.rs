@@ -24,6 +24,16 @@ enum DocumentCommands {
     List {
         #[arg(long, default_value = "false")]
         all_term: bool,
+    },
+    #[command(visible_alias("down"))]
+    Download {
+        #[arg(group = "download-type")]
+        id: Option<String>,
+        /// 文件下载目录 (支持相对路径)
+        #[arg(short, long, default_value = ".")]
+        dir: std::path::PathBuf,
+        #[arg(long, default_value = "false")]
+        all_term: bool,
     }
 }
 
@@ -114,13 +124,16 @@ async fn get_courses_and_documents(
 pub async fn run(cmd: CommandDocument) -> anyhow::Result<()> {
     match cmd.command {
         DocumentCommands::List { all_term } => list(cmd.force, !all_term, cmd.otp_code).await?,
+        DocumentCommands::Download { id, dir, all_term } => {
+            download(id.as_deref(), &dir, cmd.force, all_term, !all_term, cmd.otp_code).await?
+        }
     }
     Ok(())
 }
 
 pub async fn list(force: bool, cur_term: bool, otp_code: String) -> anyhow::Result<()> {
     let courses = get_courses_and_documents(force, cur_term, otp_code).await?;
-    let mut all_documents = courses
+    let all_documents = courses
         .iter()
         .flat_map(|(c, documents)| {
             documents
@@ -138,6 +151,97 @@ pub async fn list(force: bool, cur_term: bool, otp_code: String) -> anyhow::Resu
     }
 
     buf_try!(@try fs::stdout().write_all(outbuf).await);
+    Ok(())
+}
+
+type DocumentItem = (Arc<Course>, String, CourseDocument);
+
+async fn fetch_documents(
+    force: bool,
+    all: bool,
+    cur_term: bool,
+    otp_code: String,
+) -> anyhow::Result<Vec<DocumentItem>> {
+    let courses = get_courses_and_documents(force, cur_term, otp_code).await?;
+    let all_documents = courses
+        .into_iter()
+        .flat_map(|(c, documents)| {
+            let c = Arc::new(c);
+            documents
+                .into_iter()
+                .map(move |(id, d)| (c.clone(), id, d))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(all_documents)
+}
+
+async fn select_document(
+    mut items: Vec<DocumentItem>
+) -> anyhow::Result<DocumentItem> {
+    if items.is_empty() {
+        anyhow::bail!("document not found");
+    }
+
+    let mut options = Vec::new();
+    for (idx, (c, id, d)) in items.iter().enumerate() {
+        let mut outbuf = Vec::new();
+        write!(outbuf, "[{}] ", idx + 1)?;
+        write_document_header_ln(&mut outbuf, id, c, d).context("io error")?;
+        options.push(String::from_utf8(outbuf).unwrap());
+    }
+
+    let s = inquire::Select::new("请选择要下载的文档", options).raw_prompt()?;
+    let idx = s.index;
+    let r = items.swap_remove(idx);
+
+    Ok(r)
+}
+
+pub async fn download(
+    id: Option<&str>,
+    dir: &std::path::Path,
+    force: bool,
+    all: bool,
+    cur_term: bool,
+    otp_code: String,
+) -> anyhow::Result<()> {
+    let items = fetch_documents(force, all, cur_term, otp_code).await?;
+    let a = match id {
+        Some(id) => match items.into_iter().find(|x| x.1 == id) {
+            Some(r) => r,
+            None => anyhow::bail!("document with id {} not found", id),
+        },
+        None => select_document(items).await?,
+    };
+
+    let sp = pbar::new_spinner();
+    download_data(sp, dir, &a.2).await?;
+    Ok(())
+}
+
+async fn download_data(
+    sp: pbar::AsyncSpinner,
+    dir: &std::path::Path,
+    d: &CourseDocument,
+) -> anyhow::Result<()> {
+    if !dir.exists() {
+        compio::fs::create_dir_all(dir).await?;
+    }
+    let atts = d.attachments();
+    let tot = atts.len();
+    for (id, (name, uri)) in atts.iter().enumerate() {
+        sp.set_message(format!(
+            "[{}/{tot}] downloading attachment '{name}'...",
+            id + 1
+        ));
+        d.download_attachment(uri, &dir.join(name))
+            .await
+            .with_context(|| format!("download attachment '{name}'"))?;
+    }
+
+    drop(sp);
+    println!("Done.");
     Ok(())
 }
 
